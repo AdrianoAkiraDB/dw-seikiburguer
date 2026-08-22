@@ -156,23 +156,30 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
     }
 
     async function salvarCompra(e) {
-      e.preventDefault();
-      const qtd = parseFloat(document.getElementById('compra-qtd').value);
-      const precoUnit = parseFloat(document.getElementById('compra-preco-unit').value);
-      const total = qtd * precoUnit;
+  e.preventDefault();
+  const insumo_id = parseInt(document.getElementById('compra-insumo').value);
+  const quantidade = parseFloat(document.getElementById('compra-qtd').value);
+  const valor_unitario = parseFloat(document.getElementById('compra-preco-unit').value);
+  const valor_total = quantidade * valor_unitario;
 
-      const { error } = await _supabase.from('fct_compras_insumos').insert([{
-        data_compra: document.getElementById('compra-data').value,
-        fornecedor_id: document.getElementById('compra-fornecedor').value,
-        insumo_id: document.getElementById('compra-insumo').value,
-        quantidade_comprada: qtd,
-        preco_unitario_calculado: precoUnit,
-        valor_pago_total: total
-      }]);
+  const payload = {
+    data_compra: document.getElementById('compra-data').value,
+    fornecedor_id: parseInt(document.getElementById('compra-fornecedor').value),
+    insumo_id: insumo_id,
+    quantidade: quantidade,
+    valor_unitario: valor_unitario,
+    valor_total: valor_total
+  };
 
-      if (!error) { alert('Compra cadastrada!'); e.target.reset(); calcularTotalCompra(); }
-      else alert('Erro: ' + error.message);
-    }
+  const { error } = await _supabase.from('fct_compras_insumos').insert([payload]);
+  
+  if (!error) { 
+    alert('Compra registrada com sucesso!'); 
+    e.target.reset(); 
+  } else { 
+    alert('Erro: ' + error.message); 
+  }
+}
 
     async function salvarCusto(e) {
   e.preventDefault();
