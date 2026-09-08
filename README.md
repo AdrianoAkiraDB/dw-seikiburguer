@@ -420,3 +420,44 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 | `faturamento_bruto`, `repasse_liquidado`, `total_pedidos` | numeric/integer | Métricas consolidadas do canal no mês. |
 
 > **Relacionamentos:** Possui FK conectando com `dim_canal_vendas`. A integridade dos dados históricos é assegurada através da constraint de unicidade nos campos `(ano_mes, canal_id)`.
+
+
+
+
+
+================================================
+-- atualização feita 08/09/2026
+================================================
+
+### dim_clientes
+**Finalidade:** cadastro principal de clientes (entidade única por família/titular). Guarda os dados de identificação, endereço de entrega e o histórico acumulado para o programa de fidelidade (Gamificação).
+
+| Coluna | Tipo | Pra que serve |
+|---|---|---|
+| cliente_id | bigint, PK | chave técnica do cliente |
+| nome_cliente | varchar | nome do titular da conta |
+| telefone | varchar | telefone principal do titular (usado em relatórios e consultas rápidas) |
+| rua | varchar | logradouro e número (usado pela API de mapas para cálculo de frete por raio em KM) |
+| complemento | varchar | bloco, apartamento, casa ou ponto de referência para o motoboy |
+| bairro | varchar | bairro do cliente (usado para análises demográficas no Power BI) |
+| data_cadastro | timestamp | quando entrou na base |
+| gasto_historico_acumulado | numeric | saldo gasto antes da migração para o DW; base de cálculo do LTV para definir o nível do cliente (Bronze, Silver, Gold, Platinum, Diamante) |
+
+**Relacionamento:** referenciada por `fct_vendas`, `fct_cashback_movimentacao` e `dim_clientes_telefones`. **Não guarda saldo de cashback** — o saldo é um ledger em `fct_cashback_movimentacao` para manter histórico 100% auditável.
+
+---
+
+### dim_clientes_telefones
+**Finalidade:** catálogo de múltiplos contatos associados à mesma conta de cliente (relação 1:N). Projetada para **Resolução de Identidade (Customer 360)** e automações futuras via APIs/WhatsApp (n8n), permitindo que cônjuges e familiares façam pedidos pelo seu próprio celular e utilizem o mesmo saldo de cashback do titular.
+
+| Coluna | Tipo | Pra que serve |
+|---|---|---|
+| telefone_id | bigint, PK | chave técnica do contato |
+| cliente_id | bigint, FK | liga o telefone ao cadastro do titular em `dim_clientes` |
+| telefone | varchar | número do telefone limpo (possui índice de alta performance para busca instantânea em bots) |
+| nome_contato | varchar | identificação de quem usa o número (ex: "Esposa do Ramon", "Filho") |
+| parentesco | varchar | classificação do vínculo: Titular, Esposa, Filho, Outro |
+| eh_principal | boolean | marca se esse número é a linha prioritária do cadastro |
+| criado_em | timestamp | registro de quando o número foi vinculado |
+
+**Relacionamento:** FK para `dim_clientes` (`cliente_id`) com exclusão em cascata (`ON DELETE CASCADE`).
