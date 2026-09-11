@@ -130,6 +130,11 @@ RENAME COLUMN produto_id TO produto_sk;
 ALTER TABLE fct_movimentacao_estoque 
 RENAME COLUMN insumo_id TO insumo_sk;
 
+-- erro por tamanho de caracteres antes era VARCHAR(15) agora atualizado VARCHAR(50)
+ALTER TABLE fct_movimentacao_estoque 
+ALTER COLUMN tipo_movimentacao TYPE VARCHAR(50),
+ALTER COLUMN origem_tipo TYPE VARCHAR(50);
+
 -- =========================================================================
 -- 
 -- =========================================================================
