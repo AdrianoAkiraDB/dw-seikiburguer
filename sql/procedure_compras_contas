@@ -1,0 +1,120 @@
+-- =========================================================================
+-- 1. ADAPTAÇÃO DA STAGING DE COMPRAS (stg_compras_raw)
+-- =========================================================================
+DROP TABLE IF EXISTS stg_compras_raw CASCADE;
+
+CREATE TABLE stg_compras_raw (
+    data_compra DATE,
+    insumo_id INT,
+    fornecedor_id INT,
+    quantidade_comprada NUMERIC(10,4),
+    valor_pago_total NUMERIC(10,2),
+    
+    -- Controle do sistema
+    carregado_em TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processado BOOLEAN DEFAULT FALSE
+);
+
+-- =========================================================================
+-- 2. ADAPTAÇÃO DA STAGING DE CONTAS (stg_contas_raw)
+-- =========================================================================
+DROP TABLE IF EXISTS stg_contas_raw CASCADE;
+
+CREATE TABLE stg_contas_raw (
+    data_pagamento DATE,
+    conta_id INT,
+    valor_pago NUMERIC(10,2),
+    
+    -- Controle do sistema
+    carregado_em TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processado BOOLEAN DEFAULT FALSE
+);
+
+-- =========================================================================
+-- 3. PROCEDURE: PROCESSAR COMPRAS DE INSUMOS E ENTRADA DE ESTOQUE
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE prc_processar_compras_insumos()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- 3A. Grava na Fato de Compras de Insumos (fct_compras_insumos)
+    INSERT INTO fct_compras_insumos (
+        date_id,
+        insumo_sk,
+        fornecedor_id,
+        quantidade_comprada,
+        valor_pago_total,
+        preco_unitario_calculado
+    )
+    SELECT 
+        TO_CHAR(s.data_compra, 'YYYYMMDD')::INT AS date_id,
+        i.insumo_sk,
+        s.fornecedor_id,
+        s.quantidade_comprada,
+        s.valor_pago_total,
+        -- Preço unitário automático: Valor Total dividido pela Quantidade
+        ROUND(s.valor_pago_total / NULLIF(s.quantidade_comprada, 0), 4) AS preco_unitario_calculado
+    FROM stg_compras_raw s
+    INNER JOIN dim_insumos i 
+        ON s.insumo_id = i.insumo_id 
+       AND i.versao_atual = TRUE
+    WHERE s.processado = FALSE;
+
+    -- 3B. Dá ENTRADA POSITIVA física no Estoque (fct_movimentacao_estoque)
+    INSERT INTO fct_movimentacao_estoque (
+        date_id,
+        insumo_sk,
+        quantidade,
+        tipo_movimentacao,
+        origem_tipo,
+        origem_id,
+        observacao
+    )
+    SELECT 
+        TO_CHAR(s.data_compra, 'YYYYMMDD')::INT AS date_id,
+        i.insumo_sk,
+        s.quantidade_comprada AS quantidade, -- Valor positivo = entrada de mercadoria
+        'ENTRADA_COMPRA',
+        'stg_compras_raw',
+        NULL,
+        'Entrada de estoque via nota de compra do fornecedor #' || s.fornecedor_id
+    FROM stg_compras_raw s
+    INNER JOIN dim_insumos i 
+        ON s.insumo_id = i.insumo_id 
+       AND i.versao_atual = TRUE
+    WHERE s.processado = FALSE;
+
+    -- Marca o lote de compras como processado
+    UPDATE stg_compras_raw
+    SET processado = TRUE
+    WHERE processado = FALSE;
+
+END;
+$$;
+
+-- =========================================================================
+-- 4. PROCEDURE: PROCESSAR CONTAS PAGAS (DESPESAS / CUSTOS)
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE prc_processar_contas_pagas()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO fct_contas_pagas (
+        date_id,
+        conta_id,
+        valor_pago
+    )
+    SELECT 
+        TO_CHAR(s.data_pagamento, 'YYYYMMDD')::INT AS date_id,
+        s.conta_id,
+        s.valor_pago
+    FROM stg_contas_raw s
+    WHERE s.processado = FALSE;
+
+    -- Marca o lote de contas como processado
+    UPDATE stg_contas_raw
+    SET processado = TRUE
+    WHERE processado = FALSE;
+
+END;
+$$;
