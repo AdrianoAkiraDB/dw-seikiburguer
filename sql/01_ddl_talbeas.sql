@@ -126,6 +126,10 @@ que estava produto_sk */
 ALTER TABLE fct_itens_pedido 
 RENAME COLUMN produto_id TO produto_sk;
 
+-- deu mesmo erro da fct_itens_pedido insumo_sk para insumo_id
+ALTER TABLE fct_movimentacao_estoque 
+RENAME COLUMN insumo_id TO insumo_sk;
+
 -- =========================================================================
 -- 
 -- =========================================================================
