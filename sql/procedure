@@ -1,0 +1,600 @@
+-- =========================================================================
+-- 1. ADAPTAÇÃO DA TABELA DE STAGING (ZONA DE POUSO DO CSV)
+-- =========================================================================
+DROP TABLE IF EXISTS stg_vendas_raw CASCADE;
+
+CREATE TABLE stg_vendas_raw (
+    pedido_id BIGINT,
+    data_pedido DATE,
+    horario TIME,
+    canal_id INT,
+    cliente_id BIGINT,
+    produto_id INT,
+    quantidade INT,
+    preco_unitario NUMERIC(10,2),
+    forma_pagamento_id INT,
+    taxa_entrega NUMERIC(10,2) DEFAULT 0.00,
+    custo_entrega NUMERIC(10,2) DEFAULT 0.00,
+    cupom_desconto NUMERIC(10,2) DEFAULT 0.00,
+    cashback_usado NUMERIC(10,2) DEFAULT 0.00,
+    taxa_comissao NUMERIC(10,2) DEFAULT 0.00,
+    status_pedido VARCHAR(30) DEFAULT 'Concluido',
+    
+    -- Colunas de controle do sistema
+    carregado_em TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processado BOOLEAN DEFAULT FALSE
+);
+
+-- =========================================================================
+-- 2. PROCEDURE DE PROCESSAMENTO DE VENDAS (O MOTOR DO DW)
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE prc_processar_vendas_semana()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- ---------------------------------------------------------------------
+    -- PASSO 1: INSERE O CABEÇALHO DA VENDA (fct_vendas)
+    -- Agrupa os itens para calcular o valor total do pedido e o valor líquido
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_vendas (
+        pedido_id,
+        date_id,
+        horario,
+        canal_id,
+        cliente_id,
+        cupom_id,
+        forma_pagamento_id,
+        valor_total_pedido,
+        taxa_entrega,
+        custo_entrega,
+        cupom_desconto,
+        cashback_usado,
+        taxa_comissao,
+        taxa_pagamento_cobrada,
+        valor_liquido_recebido,
+        status_pedido
+    )
+    SELECT 
+        s.pedido_id,
+        TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT AS date_id,
+        s.horario,
+        s.canal_id,
+        s.cliente_id,
+        NULL AS cupom_id,
+        s.forma_pagamento_id,
+        -- Total do pedido: Soma dos itens + Taxa de Entrega
+        (SUM(s.quantidade * s.preco_unitario) + s.taxa_entrega) AS valor_total_pedido,
+        s.taxa_entrega,
+        s.custo_entrega,
+        s.cupom_desconto,
+        s.cashback_usado,
+        s.taxa_comissao,
+        0.0000 AS taxa_pagamento_cobrada,
+        -- Valor Líquido Real que entra no seu caixa:
+        ((SUM(s.quantidade * s.preco_unitario) + s.taxa_entrega) - s.cupom_desconto - s.cashback_usado - s.taxa_comissao) AS valor_liquido_recebido,
+        s.status_pedido
+    FROM stg_vendas_raw s
+    WHERE s.processado = FALSE
+    GROUP BY 
+        s.pedido_id, s.data_pedido, s.horario, s.canal_id, s.cliente_id,
+        s.forma_pagamento_id, s.taxa_entrega, s.custo_entrega, s.cupom_desconto,
+        s.cashback_usado, s.taxa_comissao, s.status_pedido
+    ON CONFLICT (pedido_id) DO NOTHING;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 2: INSERE OS ITENS DO PEDIDO (fct_itens_pedido)
+    -- Grava os lanches vendidos e congela o custo de produção histórico daquele dia
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_itens_pedido (
+        pedido_id,
+        produto_sk,
+        quantidade,
+        preco_venda_unitario,
+        custo_historico_unitario,
+        estoque_processado
+    )
+    SELECT 
+        s.pedido_id,
+        p.produto_sk,
+        s.quantidade,
+        s.preco_unitario,
+        COALESCE(p.custo_producao_atual, 0.0000),
+        FALSE
+    FROM stg_vendas_raw s
+    INNER JOIN dim_produtos p 
+        ON s.produto_id = p.produto_id 
+       AND p.versao_atual = TRUE
+    WHERE s.processado = FALSE;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 3: EXTRATO DE CASHBACK (fct_cashback_movimentacao)
+    -- ---------------------------------------------------------------------
+    
+    -- 3A. Se o cliente usou saldo antigo, lança o DÉBITO
+    INSERT INTO fct_cashback_movimentacao (
+        cliente_id,
+        date_id,
+        tipo_movimentacao,
+        valor,
+        data_expiracao,
+        pedido_origem_id
+    )
+    SELECT DISTINCT
+        s.cliente_id,
+        TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT AS date_id,
+        'DEBITO',
+        s.cashback_usado,
+        NULL,
+        s.pedido_id
+    FROM stg_vendas_raw s
+    WHERE s.processado = FALSE
+      AND s.cliente_id IS NOT NULL 
+      AND s.cashback_usado > 0;
+
+    -- 3B. Se ele pagou dinheiro líquido, gera o CRÉDITO novo de 5% com 90 dias de validade
+    INSERT INTO fct_cashback_movimentacao (
+        cliente_id,
+        date_id,
+        tipo_movimentacao,
+        valor,
+        data_expiracao,
+        pedido_origem_id
+    )
+    SELECT 
+        v.cliente_id,
+        v.date_id,
+        'CREDITO',
+        ROUND(v.valor_liquido_recebido * 0.05, 2) AS valor,
+        (s.data_pedido + INTERVAL '90 days')::DATE,
+        v.pedido_id
+    FROM fct_vendas v
+    INNER JOIN (
+        SELECT DISTINCT pedido_id, data_pedido 
+        FROM stg_vendas_raw 
+        WHERE processado = FALSE
+    ) s ON v.pedido_id = s.pedido_id
+    WHERE v.cliente_id IS NOT NULL
+      AND v.valor_liquido_recebido > 0;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 4: BAIXA AUTOMÁTICA DE ESTOQUE (fct_movimentacao_estoque)
+    -- Multiplica a receita da bridge pela quantidade de lanches vendidos
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_movimentacao_estoque (
+        date_id,
+        insumo_sk,
+        quantidade,
+        tipo_movimentacao,
+        origem_tipo,
+        origem_id,
+        observacao
+    )
+    SELECT 
+        v.date_id,
+        i.insumo_sk,
+        -- Quantidade negativa representando a saída física da geladeira:
+        -1 * (item.quantidade * b.quantidade_insumo) AS quantidade,
+        'SAIDA_VENDA',
+        'fct_itens_pedido',
+        item.item_pedido_id,
+        'Baixa automatica do pedido #' || v.pedido_id
+    FROM fct_itens_pedido item
+    INNER JOIN fct_vendas v 
+        ON item.pedido_id = v.pedido_id
+    INNER JOIN dim_produtos p 
+        ON item.produto_sk = p.produto_sk
+    INNER JOIN bridge_ficha_tecnica b 
+        ON p.produto_id = b.produto_id
+    INNER JOIN dim_insumos i 
+        ON b.insumo_id = i.insumo_id 
+       AND i.versao_atual = TRUE
+    WHERE item.estoque_processado = FALSE;
+
+    -- Marca os itens de lanche como já processados no estoque
+    UPDATE fct_itens_pedido
+    SET estoque_processado = TRUE
+    WHERE estoque_processado = FALSE;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 5: MARCA A STAGING COMO PROCESSADA COM SUCESSO
+    -- ---------------------------------------------------------------------
+    UPDATE stg_vendas_raw
+    SET processado = TRUE
+    WHERE processado = FALSE;
+
+END;
+$$;
+
+
+
+
+-- =========================================================================
+-- Atualizacao procedure 11/09/2026 agrupar pedidos
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE prc_processar_vendas_semana()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- ---------------------------------------------------------------------
+    -- PASSO 1: INSERE O CABEÇALHO DA VENDA (fct_vendas)
+    -- Agrupa estritamente pelo pedido_id usando MAX() para frete, cupons e taxas
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_vendas (
+        pedido_id,
+        date_id,
+        horario,
+        canal_id,
+        cliente_id,
+        cupom_id,
+        forma_pagamento_id,
+        valor_total_pedido,
+        taxa_entrega,
+        custo_entrega,
+        cupom_desconto,
+        cashback_usado,
+        taxa_comissao,
+        taxa_pagamento_cobrada,
+        valor_liquido_recebido,
+        status_pedido
+    )
+    SELECT 
+        s.pedido_id,
+        MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT) AS date_id,
+        MAX(s.horario) AS horario,
+        MAX(s.canal_id) AS canal_id,
+        MAX(s.cliente_id) AS cliente_id,
+        NULL AS cupom_id,
+        MAX(s.forma_pagamento_id) AS forma_pagamento_id,
+        -- Total do Pedido: Soma de todos os itens do combo + Taxa de Entrega
+        (SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)) AS valor_total_pedido,
+        COALESCE(MAX(s.taxa_entrega), 0.00) AS taxa_entrega,
+        COALESCE(MAX(s.custo_entrega), 0.00) AS custo_entrega,
+        COALESCE(MAX(s.cupom_desconto), 0.00) AS cupom_desconto,
+        COALESCE(MAX(s.cashback_usado), 0.00) AS cashback_usado,
+        COALESCE(MAX(s.taxa_comissao), 0.00) AS taxa_comissao,
+        0.0000 AS taxa_pagamento_cobrada,
+        -- Valor Líquido Real que entra no seu caixa:
+        (
+            (SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)) 
+            - COALESCE(MAX(s.cupom_desconto), 0.00) 
+            - COALESCE(MAX(s.cashback_usado), 0.00) 
+            - COALESCE(MAX(s.taxa_comissao), 0.00)
+        ) AS valor_liquido_recebido,
+        COALESCE(MAX(s.status_pedido), 'Concluido') AS status_pedido
+    FROM stg_vendas_raw s
+    WHERE s.processado = FALSE
+    GROUP BY s.pedido_id
+    ON CONFLICT (pedido_id) DO NOTHING;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 2: INSERE OS ITENS DO PEDIDO (fct_itens_pedido)
+    -- Grava todos os lanches vendidos (inclusive a batata zero do combo)
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_itens_pedido (
+        pedido_id,
+        produto_sk,
+        quantidade,
+        preco_venda_unitario,
+        custo_historico_unitario,
+        estoque_processado
+    )
+    SELECT 
+        s.pedido_id,
+        p.produto_sk,
+        s.quantidade,
+        s.preco_unitario,
+        COALESCE(p.custo_producao_atual, 0.0000),
+        FALSE
+    FROM stg_vendas_raw s
+    INNER JOIN dim_produtos p 
+        ON s.produto_id = p.produto_id 
+       AND p.versao_atual = TRUE
+    WHERE s.processado = FALSE;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 3: EXTRATO DE CASHBACK (fct_cashback_movimentacao)
+    -- ---------------------------------------------------------------------
+    
+    -- 3A. Se o cliente usou saldo antigo, lança o DÉBITO
+    INSERT INTO fct_cashback_movimentacao (
+        cliente_id,
+        date_id,
+        tipo_movimentacao,
+        valor,
+        data_expiracao,
+        pedido_origem_id
+    )
+    SELECT 
+        s.cliente_id,
+        MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT) AS date_id,
+        'DEBITO',
+        MAX(s.cashback_usado) AS valor,
+        NULL,
+        s.pedido_id
+    FROM stg_vendas_raw s
+    WHERE s.processado = FALSE
+      AND s.cliente_id IS NOT NULL 
+      AND s.cashback_usado > 0
+    GROUP BY s.pedido_id, s.cliente_id;
+
+    -- 3B. Se ele pagou dinheiro líquido, gera o CRÉDITO novo de 5% com 90 dias de validade
+    INSERT INTO fct_cashback_movimentacao (
+        cliente_id,
+        date_id,
+        tipo_movimentacao,
+        valor,
+        data_expiracao,
+        pedido_origem_id
+    )
+    SELECT 
+        v.cliente_id,
+        v.date_id,
+        'CREDITO',
+        ROUND(v.valor_liquido_recebido * 0.05, 2) AS valor,
+        (s.data_pedido + INTERVAL '90 days')::DATE,
+        v.pedido_id
+    FROM fct_vendas v
+    INNER JOIN (
+        SELECT pedido_id, MAX(data_pedido) AS data_pedido 
+        FROM stg_vendas_raw 
+        WHERE processado = FALSE
+        GROUP BY pedido_id
+    ) s ON v.pedido_id = s.pedido_id
+    WHERE v.cliente_id IS NOT NULL
+      AND v.valor_liquido_recebido > 0;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 4: BAIXA AUTOMÁTICA DE ESTOQUE (fct_movimentacao_estoque)
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_movimentacao_estoque (
+        date_id,
+        insumo_sk,
+        quantidade,
+        tipo_movimentacao,
+        origem_tipo,
+        origem_id,
+        observacao
+    )
+    SELECT 
+        v.date_id,
+        i.insumo_sk,
+        -1 * (item.quantidade * b.quantidade_insumo) AS quantidade,
+        'SAIDA_VENDA',
+        'fct_itens_pedido',
+        item.item_pedido_id,
+        'Baixa automatica do pedido #' || v.pedido_id
+    FROM fct_itens_pedido item
+    INNER JOIN fct_vendas v 
+        ON item.pedido_id = v.pedido_id
+    INNER JOIN dim_produtos p 
+        ON item.produto_sk = p.produto_sk
+    INNER JOIN bridge_ficha_tecnica b 
+        ON p.produto_id = b.produto_id
+    INNER JOIN dim_insumos i 
+        ON b.insumo_id = i.insumo_id 
+       AND i.versao_atual = TRUE
+    WHERE item.estoque_processado = FALSE;
+
+    -- Marca os itens de lanche como já processados no estoque
+    UPDATE fct_itens_pedido
+    SET estoque_processado = TRUE
+    WHERE estoque_processado = FALSE;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 5: MARCA A STAGING COMO PROCESSADA COM SUCESSO
+    -- ---------------------------------------------------------------------
+    UPDATE stg_vendas_raw
+    SET processado = TRUE
+    WHERE processado = FALSE;
+
+END;
+$$;
+
+
+
+
+-- =========================================================================
+-- Atualizacao denovo, erro na procedure faltou taxa_pagamento_cobrado, e formatado forma de pagamento para ifood
+-- =========================================================================
+
+
+-- =========================================================================
+-- 1. CRIAÇÃO DA COLUNA DE TAXA NA FATO DE VENDAS
+-- =========================================================================
+ALTER TABLE fct_vendas 
+ADD COLUMN IF NOT EXISTS taxa_pagamento_cobrada NUMERIC(10,4) DEFAULT 0.0000;
+
+-- =========================================================================
+-- 2. ATUALIZAÇÃO DA PROCEDURE COM A INTELIGÊNCIA DE CANAL E MAQUININHA
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE prc_processar_vendas_semana()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- ---------------------------------------------------------------------
+    -- PASSO 1: INSERE O CABEÇALHO DA VENDA (fct_vendas)
+    -- Agrupa pelo pedido_id, aplicando a regra de taxa por canal
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_vendas (
+        pedido_id,
+        date_id,
+        horario,
+        canal_id,
+        cliente_id,
+        cupom_id,
+        forma_pagamento_id,
+        valor_total_pedido,
+        taxa_entrega,
+        custo_entrega,
+        cupom_desconto,
+        cashback_usado,
+        taxa_comissao,
+        taxa_pagamento_cobrada,
+        valor_liquido_recebido,
+        status_pedido
+    )
+    SELECT 
+        s.pedido_id,
+        MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT) AS date_id,
+        MAX(s.horario) AS horario,
+        MAX(s.canal_id) AS canal_id,
+        MAX(s.cliente_id) AS cliente_id,
+        NULL AS cupom_id,
+        MAX(s.forma_pagamento_id) AS forma_pagamento_id,
+        -- Total do Pedido: Itens + Taxa de Entrega
+        (SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)) AS valor_total_pedido,
+        COALESCE(MAX(s.taxa_entrega), 0.00) AS taxa_entrega,
+        COALESCE(MAX(s.custo_entrega), 0.00) AS custo_entrega,
+        COALESCE(MAX(s.cupom_desconto), 0.00) AS cupom_desconto,
+        COALESCE(MAX(s.cashback_usado), 0.00) AS cashback_usado,
+        COALESCE(MAX(s.taxa_comissao), 0.00) AS taxa_comissao,
+        
+        -- A Regra de Ouro: iFood = 0%, Balcão/WhatsApp = taxa real da maquininha
+        CASE 
+            WHEN MAX(s.canal_id) IN (1, 2) THEN 0.0000
+            ELSE COALESCE(MAX(fp.taxa_percentual_atual), 0.0000)
+        END AS taxa_pagamento_cobrada,
+
+        -- Valor Líquido Real que entra no caixa
+        (
+            (SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)) 
+            - COALESCE(MAX(s.cupom_desconto), 0.00) 
+            - COALESCE(MAX(s.cashback_usado), 0.00) 
+            - COALESCE(MAX(s.taxa_comissao), 0.00)
+        ) AS valor_liquido_recebido,
+        
+        COALESCE(MAX(s.status_pedido), 'Concluido') AS status_pedido
+    FROM stg_vendas_raw s
+    LEFT JOIN dim_forma_pagamento fp 
+        ON s.forma_pagamento_id = fp.forma_pagamento_id
+    WHERE s.processado = FALSE
+    GROUP BY s.pedido_id
+    ON CONFLICT (pedido_id) DO NOTHING;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 2: INSERE OS ITENS DO PEDIDO (fct_itens_pedido)
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_itens_pedido (
+        pedido_id,
+        produto_sk,
+        quantidade,
+        preco_venda_unitario,
+        custo_historico_unitario,
+        estoque_processado
+    )
+    SELECT 
+        s.pedido_id,
+        p.produto_sk,
+        s.quantidade,
+        s.preco_unitario,
+        COALESCE(p.custo_producao_atual, 0.0000),
+        FALSE
+    FROM stg_vendas_raw s
+    INNER JOIN dim_produtos p 
+        ON s.produto_id = p.produto_id 
+       AND p.versao_atual = TRUE
+    WHERE s.processado = FALSE;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 3: EXTRATO DE CASHBACK (fct_cashback_movimentacao)
+    -- ---------------------------------------------------------------------
+    -- 3A. Débito de saldo utilizado
+    INSERT INTO fct_cashback_movimentacao (
+        cliente_id,
+        date_id,
+        tipo_movimentacao,
+        valor,
+        data_expiracao,
+        pedido_origem_id
+    )
+    SELECT 
+        s.cliente_id,
+        MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT) AS date_id,
+        'DEBITO',
+        MAX(s.cashback_usado) AS valor,
+        NULL,
+        s.pedido_id
+    FROM stg_vendas_raw s
+    WHERE s.processado = FALSE
+      AND s.cliente_id IS NOT NULL 
+      AND s.cashback_usado > 0
+    GROUP BY s.pedido_id, s.cliente_id;
+
+    -- 3B. Crédito de 5% sobre o valor líquido pago (validade de 90 dias)
+    INSERT INTO fct_cashback_movimentacao (
+        cliente_id,
+        date_id,
+        tipo_movimentacao,
+        valor,
+        data_expiracao,
+        pedido_origem_id
+    )
+    SELECT 
+        v.cliente_id,
+        v.date_id,
+        'CREDITO',
+        ROUND(v.valor_liquido_recebido * 0.05, 2) AS valor,
+        (s.data_pedido + INTERVAL '90 days')::DATE,
+        v.pedido_id
+    FROM fct_vendas v
+    INNER JOIN (
+        SELECT pedido_id, MAX(data_pedido) AS data_pedido 
+        FROM stg_vendas_raw 
+        WHERE processado = FALSE
+        GROUP BY pedido_id
+    ) s ON v.pedido_id = s.pedido_id
+    WHERE v.cliente_id IS NOT NULL
+      AND v.valor_liquido_recebido > 0;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 4: BAIXA AUTOMÁTICA DE ESTOQUE (fct_movimentacao_estoque)
+    -- ---------------------------------------------------------------------
+    INSERT INTO fct_movimentacao_estoque (
+        date_id,
+        insumo_sk,
+        quantidade,
+        tipo_movimentacao,
+        origem_tipo,
+        origem_id,
+        observacao
+    )
+    SELECT 
+        v.date_id,
+        i.insumo_sk,
+        -1 * (item.quantidade * b.quantidade_insumo) AS quantidade,
+        'SAIDA_VENDA',
+        'fct_itens_pedido',
+        item.item_pedido_id,
+        'Baixa automatica do pedido #' || v.pedido_id
+    FROM fct_itens_pedido item
+    INNER JOIN fct_vendas v 
+        ON item.pedido_id = v.pedido_id
+    INNER JOIN dim_produtos p 
+        ON item.produto_sk = p.produto_sk
+    INNER JOIN bridge_ficha_tecnica b 
+        ON p.produto_id = b.produto_id
+    INNER JOIN dim_insumos i 
+        ON b.insumo_id = i.insumo_id 
+       AND i.versao_atual = TRUE
+    WHERE item.estoque_processado = FALSE;
+
+    -- Marca os itens como processados
+    UPDATE fct_itens_pedido
+    SET estoque_processado = TRUE
+    WHERE estoque_processado = FALSE;
+
+    -- ---------------------------------------------------------------------
+    -- PASSO 5: MARCA A STAGING COMO PROCESSADA
+    -- ---------------------------------------------------------------------
+    UPDATE stg_vendas_raw
+    SET processado = TRUE
+    WHERE processado = FALSE;
+
+END;
+$$;
+
+
+
+-- =========================================================================
+-- 
+-- =========================================================================
