@@ -118,5 +118,14 @@ ALTER COLUMN pedido_id DROP IDENTITY IF EXISTS;
 
 
 -- =========================================================================
+/* atualizacao da fct_itens_pedido estava dando erro stg_vendas_raw procedure buscando produto_id sendo 
+que estava produto_sk */
+-- =========================================================================
+
+
+ALTER TABLE fct_itens_pedido 
+RENAME COLUMN produto_id TO produto_sk;
+
+-- =========================================================================
 -- 
 -- =========================================================================
