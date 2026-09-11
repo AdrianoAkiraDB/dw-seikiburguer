@@ -1,0 +1,17 @@
+-- 1. Remove o backup antigo desatualizado
+DROP SCHEMA IF EXISTS backup_pre_refactor CASCADE;
+
+-- 2. Cria o novo schema de backup seguro
+CREATE SCHEMA backup_pre_refactor;
+
+-- 3. Clona todas as tabelas e dados atuais do schema 'public' para o 'backup_pre_refactor'
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') 
+    LOOP
+        EXECUTE format('CREATE TABLE backup_pre_refactor.%I AS TABLE public.%I;', r.tablename, r.tablename);
+    END LOOP;
+    RAISE NOTICE 'Backup completo e atualizado com sucesso no schema backup_pre_refactor!';
+END $$;
