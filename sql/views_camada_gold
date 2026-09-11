@@ -1,0 +1,66 @@
+-- =========================================================================
+-- 1. VIEW: CLASSIFICAÇÃO E NÍVEL DOS CLIENTES (LTV / GAMIFICAÇÃO)
+-- =========================================================================
+CREATE OR REPLACE VIEW vw_clientes_gamificacao AS
+SELECT 
+    c.cliente_id,
+    c.nome_cliente,
+    c.telefone,
+    c.bairro,
+    -- Gasto Total da Vida = Histórico Antigo + Pedidos Novos no DW
+    COALESCE(c.gasto_historico_acumulado, 0.00) + COALESCE(SUM(v.valor_total_pedido), 0.00) AS total_gasto_vida,
+    
+    -- Níveis de Fidelidade
+    CASE 
+        WHEN (COALESCE(c.gasto_historico_acumulado, 0.00) + COALESCE(SUM(v.valor_total_pedido), 0.00)) >= 5000.00 THEN 'Diamante'
+        WHEN (COALESCE(c.gasto_historico_acumulado, 0.00) + COALESCE(SUM(v.valor_total_pedido), 0.00)) >= 2000.00 THEN 'Platinum'
+        WHEN (COALESCE(c.gasto_historico_acumulado, 0.00) + COALESCE(SUM(v.valor_total_pedido), 0.00)) >= 1000.00 THEN 'Gold'
+        WHEN (COALESCE(c.gasto_historico_acumulado, 0.00) + COALESCE(SUM(v.valor_total_pedido), 0.00)) >= 500.00 THEN 'Silver'
+        ELSE 'Bronze'
+    END AS nivel_cliente,
+    
+    COUNT(v.pedido_id) AS total_pedidos_novos
+FROM dim_clientes c
+LEFT JOIN fct_vendas v ON c.cliente_id = v.cliente_id
+GROUP BY c.cliente_id, c.nome_cliente, c.telefone, c.bairro, c.gasto_historico_acumulado;
+
+-- =========================================================================
+-- 2. VIEW: SALDO LÍQUIDO DE CASHBACK POR CLIENTE
+-- =========================================================================
+CREATE OR REPLACE VIEW vw_saldo_cashback_clientes AS
+SELECT 
+    c.cliente_id,
+    c.nome_cliente,
+    c.telefone,
+    -- Saldo Disponível = Créditos Válidos - Débitos Usados
+    COALESCE(SUM(
+        CASE 
+            WHEN m.tipo_movimentacao = 'CREDITO' 
+                 AND (m.data_expiracao IS NULL OR m.data_expiracao >= CURRENT_DATE) 
+            THEN m.valor 
+            WHEN m.tipo_movimentacao = 'DEBITO' 
+            THEN -1 * m.valor 
+            ELSE 0.00 
+        END
+    ), 0.00) AS saldo_cashback_disponivel
+FROM dim_clientes c
+LEFT JOIN fct_cashback_movimentacao m ON c.cliente_id = m.cliente_id
+GROUP BY c.cliente_id, c.nome_cliente, c.telefone;
+
+-- =========================================================================
+-- 3. VIEW: SALDO ATUAL DE ESTOQUE (QUANTIDADE E VALOR PARADO)
+-- =========================================================================
+CREATE OR REPLACE VIEW vw_saldo_estoque_atual AS
+SELECT 
+    i.insumo_id,
+    i.nome_insumo,
+    i.unidade_medida,
+    i.custo_unitario,
+    -- Soma das entradas (compras) e saídas (vendas/perdas)
+    COALESCE(SUM(m.quantidade), 0.0000) AS saldo_quantidade_atual,
+    -- Valor total em dinheiro parado naquele insumo
+    ROUND(COALESCE(SUM(m.quantidade), 0.0000) * i.custo_unitario, 2) AS valor_financeiro_estoque
+FROM dim_insumos i
+LEFT JOIN fct_movimentacao_estoque m ON i.insumo_sk = m.insumo_sk
+WHERE i.versao_atual = TRUE
+GROUP BY i.insumo_id, i.nome_insumo, i.unidade_medida, i.custo_unitario;
