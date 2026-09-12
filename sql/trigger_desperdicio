@@ -1,0 +1,53 @@
+-- =========================================================================
+-- 1. GARANTE QUE A COLUNA SEJA insumo_sk (PADRÃO SCD2)
+-- =========================================================================
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'fct_perdas_desperdicio' AND column_name = 'insumo_id'
+    ) THEN
+        ALTER TABLE fct_perdas_desperdicio RENAME COLUMN insumo_id TO insumo_sk;
+    END IF;
+END $$;
+
+-- =========================================================================
+-- 2. FUNÇÃO E GATILHO (TRIGGER): BAIXA AUTOMÁTICA DE ESTOQUE POR PERDA
+-- =========================================================================
+CREATE OR REPLACE FUNCTION fn_processar_perda_estoque()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Toda vez que uma perda for inserida, cria a saída física no estoque
+    INSERT INTO fct_movimentacao_estoque (
+        date_id,
+        insumo_sk,
+        quantidade,
+        tipo_movimentacao,
+        origem_tipo,
+        origem_id,
+        observacao
+    )
+    VALUES (
+        NEW.date_id,
+        NEW.insumo_sk,
+        -- Garante que o valor saia negativo no estoque:
+        -1 * ABS(NEW.quantidade),
+        'PERDA',
+        'fct_perdas_desperdicio',
+        NEW.perda_id,
+        'Desperdicio registrado: ' || NEW.motivo || COALESCE(' - ' || NEW.observacao, '')
+    );
+    
+    RETURN NEW;
+END;
+$$;
+
+-- Aplica o gatilho na tabela de perdas
+DROP TRIGGER IF EXISTS trg_apos_inserir_perda ON fct_perdas_desperdicio;
+
+CREATE TRIGGER trg_apos_inserir_perda
+AFTER INSERT ON fct_perdas_desperdicio
+FOR EACH ROW
+EXECUTE FUNCTION fn_processar_perda_estoque();
