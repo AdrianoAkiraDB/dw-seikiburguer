@@ -579,14 +579,14 @@ Nesta etapa, foi desenvolvida e integrada a **Frente de Caixa (PDV Web)** direta
 
 ### 3. Sistema Operacional Multi-Abas (4 Módulos)
 A interface foi modularizada em um único arquivo, alternando as telas instantaneamente sem recarregar o navegador:
-1. **🍔 PDV (Vendas):** 
+1. ** PDV (Vendas):** 
    - Cálculo em tempo real do DRE da venda (Subtotal, Taxa de Entrega, Deduções de Cupom/Cashback, Custos de Comissão/Motoboy e Valor Líquido Real).
    - "Combo Trick" com preço unitário editável para viabilizar itens de combos a R$ 0,00 sem quebrar a baixa de estoque na Ficha Técnica.
    - Alternância inteligente entre *Delivery* e *Retirada/Balcão*, com zeramento automático dos campos de frete.
    - Busca dinâmica de clientes por nome ou telefone com *Debounce* de 300ms. Grava em `stg_vendas_raw`.
-2. **💸 Lançamento de Despesas:** Dropdown dinâmico que carrega o plano de contas da `dim_contas_a_pagar` e grava saídas na `stg_contas_raw`.
-3. **🛒 Compras de Insumos:** Dropdowns dinâmicos carregando fornecedores ativos (`dim_fornecedores`) e matérias-primas (`dim_insumos`). Alimenta a `stg_compras_raw` para posterior cálculo de inflação e entrada no estoque.
-4. **👥 Cadastro de Clientes e CRM (Resolução 1:N):** Cadastro rápido de balcão com duas opções:
+2. ** Lançamento de Despesas:** Dropdown dinâmico que carrega o plano de contas da `dim_contas_a_pagar` e grava saídas na `stg_contas_raw`.
+3. ** Compras de Insumos:** Dropdowns dinâmicos carregando fornecedores ativos (`dim_fornecedores`) e matérias-primas (`dim_insumos`). Alimenta a `stg_compras_raw` para posterior cálculo de inflação e entrada no estoque.
+4. ** Cadastro de Clientes e CRM (Resolução 1:N):** Cadastro rápido de balcão com duas opções:
    - *Novo Titular:* Cria a conta mestre na `dim_clientes` e gera automaticamente o registro principal na `dim_clientes_telefones` (`eh_principal = true`, `parentesco = 'Titular'`).
    - *Vincular Parente:* Busca o titular existente e adiciona novos telefones da mesma família (`eh_principal = false`), unificando o acúmulo de LTV e cashback na residência.
 
