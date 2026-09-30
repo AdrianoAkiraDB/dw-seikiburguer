@@ -424,7 +424,7 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 
 ---
 
-## **atualização feita 08/09/2026**
+## `atualização feita 08/09/2026`
 
 ---
 
@@ -467,7 +467,7 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 
 ---
 
-##  **atualização feita 10/09/2026**
+##  `atualização feita 10/09/2026`
 
 ---
 
@@ -503,7 +503,7 @@ Recentemente, o Data Warehouse passou por uma grande evolução arquitetural par
 
 ---
 
-##  **atualização feita 12/09/2026**
+##  `atualização feita 12/09/2026`
 
 ---
 
@@ -557,7 +557,7 @@ Mais do que código, o Data Warehouse entregou clareza contábil definitiva para
 
 ---
 
-## **atualização feita 30/09/2026**
+## `atualização feita 30/09/2026`
 
 ---
 
