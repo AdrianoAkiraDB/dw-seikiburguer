@@ -424,7 +424,7 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 
 ---
 
-## atualização feita 08/09/2026
+## **atualização feita 08/09/2026**
 
 ---
 
@@ -467,7 +467,7 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 
 ---
 
-##  atualização feita 10/09/2026
+##  **atualização feita 10/09/2026**
 
 ---
 
@@ -503,7 +503,7 @@ Recentemente, o Data Warehouse passou por uma grande evolução arquitetural par
 
 ---
 
-##  atualização feita 12/09/2026
+##  **atualização feita 12/09/2026**
 
 ---
 
@@ -553,6 +553,45 @@ Mais do que código, o Data Warehouse entregou clareza contábil definitiva para
 - **Linguagens e Frameworks:** SQL Avançado, PL/pgSQL (Procedures e Triggers)
   
 - **Metodologia:** Modelagem Dimensional Kimball (Star Schema, SCD Tipo 2, Ledgers, Bridge Tables)
+
+
+---
+
+## **atualização feita 30/09/2026**
+
+---
+
+## Go-Live do PDV Operacional Web e Camada de Segurança (Supabase Auth & RLS)
+
+Nesta etapa, foi desenvolvida e integrada a **Frente de Caixa (PDV Web)** diretamente conectada às APIs do Supabase, substituindo definitivamente o uso de planilhas manuais e garantindo a ingestão diária de dados em tempo real.
+
+### 1. Desenvolvimento do PDV Web (Vanilla SPA)
+- **Tecnologia:** Aplicação Single Page em arquivo único (`index.html`) construída com JavaScript puro, Tailwind CSS e Phosphor Icons via CDN. Zero dependência de build ou servidores Node.js.
+- **Conectividade:** Comunicação direta com o PostgreSQL via biblioteca oficial `@supabase/supabase-js`.
+
+### 2. Camada de Segurança e Autenticação (Supabase Auth & RLS)
+- **Tela de Login Restrita:** O sistema inicia bloqueado, exigindo login e senha do proprietário via `signInWithPassword()`. Não há opção pública de cadastro.
+- **Persistência de Sessão:** Verificação automática de token JWT (`getSession()`) mantendo o operador conectado mesmo após recarregar a página.
+- **Evolução do RLS (Row Level Security):** O RLS foi reativado com **Políticas de Acesso (Policies)** estritas para usuários autenticados:
+  * Leitura liberada para catálogos: `dim_produtos`, `dim_insumos`, `dim_fornecedores`, `dim_contas_a_pagar`.
+  * Leitura e inserção liberadas para CRM: `dim_clientes`, `dim_clientes_telefones`.
+  * Inserção liberada nas zonas de pouso: `stg_vendas_raw`, `stg_contas_raw`, `stg_compras_raw`.
+
+### 3. Sistema Operacional Multi-Abas (4 Módulos)
+A interface foi modularizada em um único arquivo, alternando as telas instantaneamente sem recarregar o navegador:
+1. **🍔 PDV (Vendas):** 
+   - Cálculo em tempo real do DRE da venda (Subtotal, Taxa de Entrega, Deduções de Cupom/Cashback, Custos de Comissão/Motoboy e Valor Líquido Real).
+   - "Combo Trick" com preço unitário editável para viabilizar itens de combos a R$ 0,00 sem quebrar a baixa de estoque na Ficha Técnica.
+   - Alternância inteligente entre *Delivery* e *Retirada/Balcão*, com zeramento automático dos campos de frete.
+   - Busca dinâmica de clientes por nome ou telefone com *Debounce* de 300ms. Grava em `stg_vendas_raw`.
+2. **💸 Lançamento de Despesas:** Dropdown dinâmico que carrega o plano de contas da `dim_contas_a_pagar` e grava saídas na `stg_contas_raw`.
+3. **🛒 Compras de Insumos:** Dropdowns dinâmicos carregando fornecedores ativos (`dim_fornecedores`) e matérias-primas (`dim_insumos`). Alimenta a `stg_compras_raw` para posterior cálculo de inflação e entrada no estoque.
+4. **👥 Cadastro de Clientes e CRM (Resolução 1:N):** Cadastro rápido de balcão com duas opções:
+   - *Novo Titular:* Cria a conta mestre na `dim_clientes` e gera automaticamente o registro principal na `dim_clientes_telefones` (`eh_principal = true`, `parentesco = 'Titular'`).
+   - *Vincular Parente:* Busca o titular existente e adiciona novos telefones da mesma família (`eh_principal = false`), unificando o acúmulo de LTV e cashback na residência.
+
+### 4. Sincronização de Sequences (`setval`)
+- Execução do alinhamento do contador interno automático do PostgreSQL (`IDENTITY`) nas tabelas `dim_clientes` e `dim_clientes_telefones`, garantindo que novos cadastros gerem IDs automáticos a partir do número 701 sem colisão com os 700 clientes legados importados.
   
 - **Conectividade:** Driver psqlODBC 64-bit (SSL Mode Require)
   
