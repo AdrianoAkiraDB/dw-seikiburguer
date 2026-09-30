@@ -421,13 +421,14 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 
 > **Relacionamentos:** Possui FK conectando com `dim_canal_vendas`. A integridade dos dados históricos é assegurada através da constraint de unicidade nos campos `(ano_mes, canal_id)`.
 
-================================================================================================
 
 
 
-================================================
+
 -- atualização feita 08/09/2026
-================================================
+
+
+
 
 ### dim_clientes
 **Finalidade:** cadastro principal de clientes (entidade única por família/titular). Guarda os dados de identificação, endereço de entrega e o histórico acumulado para o programa de fidelidade (Gamificação).
@@ -462,12 +463,15 @@ Tabelas do modelo reservadas exclusivamente para abrigar a carga histórica cons
 
 **Relacionamento:** FK para `dim_clientes` (`cliente_id`) com exclusão em cascata (`ON DELETE CASCADE`).
 
-================================================================================================
 
 
-================================================
+
+
+
 -- atualização feita 10/09/2026
-================================================
+
+
+
 
 
 ## Evolução da Arquitetura: Clientes, CRM e Pipeline ELT
@@ -497,14 +501,15 @@ Recentemente, o Data Warehouse passou por uma grande evolução arquitetural par
   4. *Baixa Automática de Estoque:* Cálculo em tempo real da queima de insumos em `fct_movimentacao_estoque` baseado nas receitas da `bridge_ficha_tecnica`.
  
 
-================================================================================================
 
-================================================
-================================================
-================================================
+
+
+
 -- atualização feita 12/09/2026
-================================================
-================================================
+
+
+
+
 
 ##  Conclusão do Projeto: Arquitetura Final e Impacto Real de Negócio
 
