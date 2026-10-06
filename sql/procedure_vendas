@@ -700,7 +700,149 @@ EXCEPTION WHEN OTHERS THEN
 
     INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
     VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, 0, 'FALHA', SQLERRM);
+
+
+
+
+
+==============================================================
+-- Atualizacao porque criamos tabela de quarentena
+==============================================================
+
+CREATE OR REPLACE PROCEDURE prc_processar_vendas_semana()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_inicio TIMESTAMPTZ := clock_timestamp();
+    v_fim TIMESTAMPTZ;
+    v_segundos NUMERIC(10, 2);
+    v_pedidos_count INTEGER := 0;
+    v_rejeitados_count INTEGER := 0;
+BEGIN
+    -- =========================================================================
+    -- PASSO 0: TRIAGEM DE QUALIDADE DE DADOS (QUARENTENA / DEAD LETTER QUEUE)
+    -- =========================================================================
     
+    -- 0.1 Move pedidos que violam o "Contrato de Dados" para a Quarentena
+    INSERT INTO stg_vendas_rejeitadas (
+        pedido_id, data_pedido, horario, canal_id, cliente_id, produto_id,
+        quantidade, preco_unitario, forma_pagamento_id, taxa_entrega, custo_entrega,
+        cupom_desconto, cashback_usado, taxa_comissao, status_pedido, motivo_rejeicao
+    )
+    SELECT 
+        s.pedido_id, s.data_pedido, s.horario, s.canal_id, s.cliente_id, s.produto_id,
+        s.quantidade, s.preco_unitario, s.forma_pagamento_id, s.taxa_entrega, s.custo_entrega,
+        s.cupom_desconto, s.cashback_usado, s.taxa_comissao, 'Rejeitado',
+        CASE 
+            WHEN s.quantidade <= 0 THEN 'Quantidade menor ou igual a zero'
+            WHEN s.preco_unitario < 0 THEN 'Preco unitario negativo'
+            WHEN s.data_pedido > (CURRENT_DATE + INTERVAL '1 day')::DATE THEN 'Data do pedido no futuro'
+            WHEN s.canal_id NOT IN (1, 2, 3, 4, 5) THEN 'Canal de venda invalido'
+            WHEN s.forma_pagamento_id NOT IN (1, 2, 3, 4) THEN 'Forma de pagamento invalida'
+            ELSE 'Inconsistencia de contrato de dados'
+        END
+    FROM stg_vendas_raw s
+    WHERE s.processado = FALSE
+      AND (
+          s.quantidade <= 0
+          OR s.preco_unitario < 0
+          OR s.data_pedido > (CURRENT_DATE + INTERVAL '1 day')::DATE
+          OR s.canal_id NOT IN (1, 2, 3, 4, 5)
+          OR s.forma_pagamento_id NOT IN (1, 2, 3, 4)
+      );
+
+    -- 0.2 Marca as linhas rejeitadas como processadas na Staging (para não travar a fila)
+    UPDATE stg_vendas_raw
+    SET processado = TRUE, status_pedido = 'Rejeitado'
+    WHERE processado = FALSE
+      AND (
+          quantidade <= 0
+          OR preco_unitario < 0
+          OR data_pedido > (CURRENT_DATE + INTERVAL '1 day')::DATE
+          OR canal_id NOT IN (1, 2, 3, 4, 5)
+          OR forma_pagamento_id NOT IN (1, 2, 3, 4)
+      );
+
+    -- =========================================================================
+    -- PASSO 1: CONTAGEM DE PEDIDOS VÁLIDOS PENDENTES
+    -- =========================================================================
+    SELECT COUNT(DISTINCT pedido_id)
+    INTO v_pedidos_count
+    FROM stg_vendas_raw
+    WHERE processado = FALSE;
+
+    -- Se não houver nenhum pedido válido restante, anota no log e encerra
+    IF v_pedidos_count = 0 THEN
+        v_fim := clock_timestamp();
+        v_segundos := ROUND(EXTRACT(EPOCH FROM (v_fim - v_inicio))::NUMERIC, 2);
+        
+        INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
+        VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, 0, 'SUCESSO', 'Nenhum pedido pendente para processar.');
+        RETURN;
+    END IF;
+
+    -- =========================================================================
+    -- PASSO 2: CABEÇALHO DA VENDA (fct_vendas) COM DADOS VÁLIDOS
+    -- =========================================================================
+    INSERT INTO fct_vendas (pedido_id, date_id, horario, canal_id, cliente_id, cupom_id, forma_pagamento_id, valor_total_pedido, taxa_entrega, custo_entrega, cupom_desconto, cashback_usado, taxa_comissao, taxa_pagamento_cobrada, valor_liquido_recebido, status_pedido)
+    SELECT 
+        s.pedido_id, MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT), MAX(s.horario), MAX(s.canal_id), MAX(s.cliente_id), NULL, MAX(s.forma_pagamento_id),
+        (SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)),
+        COALESCE(MAX(s.taxa_entrega), 0.00), COALESCE(MAX(s.custo_entrega), 0.00), COALESCE(MAX(s.cupom_desconto), 0.00), COALESCE(MAX(s.cashback_usado), 0.00), COALESCE(MAX(s.taxa_comissao), 0.00),
+        CASE WHEN MAX(s.canal_id) IN (1, 2, 3) THEN 0.0000 ELSE COALESCE(MAX(fp.taxa_percentual_atual), 0.0000) END,
+        ((SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)) - COALESCE(MAX(s.cupom_desconto), 0.00) - COALESCE(MAX(s.cashback_usado), 0.00) - COALESCE(MAX(s.taxa_comissao), 0.00)),
+        COALESCE(MAX(s.status_pedido), 'Concluido')
+    FROM stg_vendas_raw s LEFT JOIN dim_forma_pagamento fp ON s.forma_pagamento_id = fp.forma_pagamento_id
+    WHERE s.processado = FALSE GROUP BY s.pedido_id ON CONFLICT (pedido_id) DO NOTHING;
+
+    -- =========================================================================
+    -- PASSO 3: ITENS DO PEDIDO (fct_itens_pedido) COM SNAPSHOT SCD2
+    -- =========================================================================
+    INSERT INTO fct_itens_pedido (pedido_id, produto_sk, quantidade, preco_venda_unitario, custo_historico_unitario, estoque_processado)
+    SELECT s.pedido_id, p.produto_sk, s.quantidade, s.preco_unitario, COALESCE(p.custo_producao_atual, 0.0000), FALSE
+    FROM stg_vendas_raw s INNER JOIN dim_produtos p ON s.produto_id = p.produto_id AND p.versao_atual = TRUE WHERE s.processado = FALSE;
+
+    -- =========================================================================
+    -- PASSO 4: CASHBACK (DÉBITO E CRÉDITO PARA CANAL 4)
+    -- =========================================================================
+    INSERT INTO fct_cashback_movimentacao (cliente_id, date_id, tipo_movimentacao, valor, data_expiracao, pedido_origem_id)
+    SELECT s.cliente_id, MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT), 'DEBITO', MAX(s.cashback_usado), NULL, s.pedido_id
+    FROM stg_vendas_raw s WHERE s.processado = FALSE AND s.cliente_id IS NOT NULL AND s.cashback_usado > 0 AND s.canal_id = 4 GROUP BY s.pedido_id, s.cliente_id;
+
+    INSERT INTO fct_cashback_movimentacao (cliente_id, date_id, tipo_movimentacao, valor, data_expiracao, pedido_origem_id)
+    SELECT v.cliente_id, v.date_id, 'CREDITO', ROUND(v.valor_liquido_recebido * 0.05, 2), (s.data_pedido + INTERVAL '90 days')::DATE, v.pedido_id
+    FROM fct_vendas v INNER JOIN (SELECT pedido_id, MAX(data_pedido) AS data_pedido FROM stg_vendas_raw WHERE processado = FALSE GROUP BY pedido_id) s ON v.pedido_id = s.pedido_id
+    WHERE v.cliente_id IS NOT NULL AND v.valor_liquido_recebido > 0 AND v.canal_id = 4;
+
+    -- =========================================================================
+    -- PASSO 5: BAIXA FÍSICA DE ESTOQUE VIA FICHA TÉCNICA E ATUALIZAÇÃO DA STAGING
+    -- =========================================================================
+    INSERT INTO fct_movimentacao_estoque (date_id, insumo_sk, quantidade, tipo_movimentacao, origem_tipo, origem_id, observacao)
+    SELECT v.date_id, i.insumo_sk, -1 * (item.quantidade * b.quantidade_insumo), 'SAIDA_VENDA', 'fct_itens_pedido', item.item_pedido_id, 'Baixa automatica do pedido #' || v.pedido_id
+    FROM fct_itens_pedido item INNER JOIN fct_vendas v ON item.pedido_id = v.pedido_id INNER JOIN dim_produtos p ON item.produto_sk = p.produto_sk INNER JOIN bridge_ficha_tecnica b ON p.produto_id = b.produto_id INNER JOIN dim_insumos i ON b.insumo_id = i.insumo_id AND i.versao_atual = TRUE WHERE item.estoque_processado = FALSE;
+
+    UPDATE fct_itens_pedido SET estoque_processado = TRUE WHERE estoque_processado = FALSE;
+    UPDATE stg_vendas_raw SET processado = TRUE WHERE processado = FALSE;
+
+    -- =========================================================================
+    -- PASSO 6: REGISTRO DE SUCESSO NA TABELA DE AUDITORIA (LOGS)
+    -- =========================================================================
+    v_fim := clock_timestamp();
+    v_segundos := ROUND(EXTRACT(EPOCH FROM (v_fim - v_inicio))::NUMERIC, 2);
+
+    INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
+    VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, v_pedidos_count, 'SUCESSO', NULL);
+
+EXCEPTION WHEN OTHERS THEN
+    v_fim := clock_timestamp();
+    v_segundos := ROUND(EXTRACT(EPOCH FROM (v_fim - v_inicio))::NUMERIC, 2);
+
+    INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
+    VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, 0, 'FALHA', SQLERRM);
+    
+    RAISE;
+END;
+$$;
     RAISE; -- Repassa o erro para o log do servidor
 END;
 $$;
