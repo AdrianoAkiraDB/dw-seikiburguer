@@ -621,3 +621,86 @@ CREATE POLICY "Permitir leitura de logs"
 ON log_execucao_etl 
 FOR SELECT 
 USING (true);
+
+
+
+
+-- Atualização da procedure 
+CREATE OR REPLACE PROCEDURE prc_processar_vendas_semana()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_inicio TIMESTAMPTZ := clock_timestamp();
+    v_fim TIMESTAMPTZ;
+    v_segundos NUMERIC(10, 2);
+    v_pedidos_count INTEGER := 0;
+BEGIN
+    -- 0. CONTA QUANTOS PEDIDOS PENDENTES EXISTEM NA STAGING
+    SELECT COUNT(DISTINCT pedido_id)
+    INTO v_pedidos_count
+    FROM stg_vendas_raw
+    WHERE processado = FALSE;
+
+    -- Se não houver nenhum pedido pendente, anota no log e encerra rápido
+    IF v_pedidos_count = 0 THEN
+        v_fim := clock_timestamp();
+        v_segundos := ROUND(EXTRACT(EPOCH FROM (v_fim - v_inicio))::NUMERIC, 2);
+        
+        INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
+        VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, 0, 'SUCESSO', 'Nenhum pedido pendente para processar.');
+        RETURN;
+    END IF;
+
+    -- PASSO 1: CABEÇALHO DA VENDA (fct_vendas) com regra de taxa por canal
+    INSERT INTO fct_vendas (pedido_id, date_id, horario, canal_id, cliente_id, cupom_id, forma_pagamento_id, valor_total_pedido, taxa_entrega, custo_entrega, cupom_desconto, cashback_usado, taxa_comissao, taxa_pagamento_cobrada, valor_liquido_recebido, status_pedido)
+    SELECT 
+        s.pedido_id, MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT), MAX(s.horario), MAX(s.canal_id), MAX(s.cliente_id), NULL, MAX(s.forma_pagamento_id),
+        (SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)),
+        COALESCE(MAX(s.taxa_entrega), 0.00), COALESCE(MAX(s.custo_entrega), 0.00), COALESCE(MAX(s.cupom_desconto), 0.00), COALESCE(MAX(s.cashback_usado), 0.00), COALESCE(MAX(s.taxa_comissao), 0.00),
+        CASE WHEN MAX(s.canal_id) IN (1, 2, 3) THEN 0.0000 ELSE COALESCE(MAX(fp.taxa_percentual_atual), 0.0000) END,
+        ((SUM(s.quantidade * s.preco_unitario) + COALESCE(MAX(s.taxa_entrega), 0.00)) - COALESCE(MAX(s.cupom_desconto), 0.00) - COALESCE(MAX(s.cashback_usado), 0.00) - COALESCE(MAX(s.taxa_comissao), 0.00)),
+        COALESCE(MAX(s.status_pedido), 'Concluido')
+    FROM stg_vendas_raw s LEFT JOIN dim_forma_pagamento fp ON s.forma_pagamento_id = fp.forma_pagamento_id
+    WHERE s.processado = FALSE GROUP BY s.pedido_id ON CONFLICT (pedido_id) DO NOTHING;
+
+    -- PASSO 2: ITENS DO PEDIDO (fct_itens_pedido)
+    INSERT INTO fct_itens_pedido (pedido_id, produto_sk, quantidade, preco_venda_unitario, custo_historico_unitario, estoque_processado)
+    SELECT s.pedido_id, p.produto_sk, s.quantidade, s.preco_unitario, COALESCE(p.custo_producao_atual, 0.0000), FALSE
+    FROM stg_vendas_raw s INNER JOIN dim_produtos p ON s.produto_id = p.produto_id AND p.versao_atual = TRUE WHERE s.processado = FALSE;
+
+    -- PASSO 3: CASHBACK (DÉBITO e CRÉDITO para Canal 4 - Balcão/WhatsApp)
+    INSERT INTO fct_cashback_movimentacao (cliente_id, date_id, tipo_movimentacao, valor, data_expiracao, pedido_origem_id)
+    SELECT s.cliente_id, MAX(TO_CHAR(s.data_pedido, 'YYYYMMDD')::INT), 'DEBITO', MAX(s.cashback_usado), NULL, s.pedido_id
+    FROM stg_vendas_raw s WHERE s.processado = FALSE AND s.cliente_id IS NOT NULL AND s.cashback_usado > 0 AND s.canal_id = 4 GROUP BY s.pedido_id, s.cliente_id;
+
+    INSERT INTO fct_cashback_movimentacao (cliente_id, date_id, tipo_movimentacao, valor, data_expiracao, pedido_origem_id)
+    SELECT v.cliente_id, v.date_id, 'CREDITO', ROUND(v.valor_liquido_recebido * 0.05, 2), (s.data_pedido + INTERVAL '90 days')::DATE, v.pedido_id
+    FROM fct_vendas v INNER JOIN (SELECT pedido_id, MAX(data_pedido) AS data_pedido FROM stg_vendas_raw WHERE processado = FALSE GROUP BY pedido_id) s ON v.pedido_id = s.pedido_id
+    WHERE v.cliente_id IS NOT NULL AND v.valor_liquido_recebido > 0 AND v.canal_id = 4;
+
+    -- PASSO 4: BAIXA DE ESTOQUE E ATUALIZAÇÃO DA STAGING
+    INSERT INTO fct_movimentacao_estoque (date_id, insumo_sk, quantidade, tipo_movimentacao, origem_tipo, origem_id, observacao)
+    SELECT v.date_id, i.insumo_sk, -1 * (item.quantidade * b.quantidade_insumo), 'SAIDA_VENDA', 'fct_itens_pedido', item.item_pedido_id, 'Baixa automatica do pedido #' || v.pedido_id
+    FROM fct_itens_pedido item INNER JOIN fct_vendas v ON item.pedido_id = v.pedido_id INNER JOIN dim_produtos p ON item.produto_sk = p.produto_sk INNER JOIN bridge_ficha_tecnica b ON p.produto_id = b.produto_id INNER JOIN dim_insumos i ON b.insumo_id = i.insumo_id AND i.versao_atual = TRUE WHERE item.estoque_processado = FALSE;
+
+    UPDATE fct_itens_pedido SET estoque_processado = TRUE WHERE estoque_processado = FALSE;
+    UPDATE stg_vendas_raw SET processado = TRUE WHERE processado = FALSE;
+
+    -- PASSO 5: REGISTRA SUCESSO NA TABELA DE LOGS
+    v_fim := clock_timestamp();
+    v_segundos := ROUND(EXTRACT(EPOCH FROM (v_fim - v_inicio))::NUMERIC, 2);
+
+    INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
+    VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, v_pedidos_count, 'SUCESSO', NULL);
+
+-- TRATAMENTO DE ERROS (Se algo der errado, anota a falha no log e avisa o banco)
+EXCEPTION WHEN OTHERS THEN
+    v_fim := clock_timestamp();
+    v_segundos := ROUND(EXTRACT(EPOCH FROM (v_fim - v_inicio))::NUMERIC, 2);
+
+    INSERT INTO log_execucao_etl (nome_rotina, inicio_execucao, fim_execucao, tempo_execucao_segundos, linhas_processadas, status, mensagem_erro)
+    VALUES ('prc_processar_vendas_semana', v_inicio, v_fim, v_segundos, 0, 'FALHA', SQLERRM);
+    
+    RAISE; -- Repassa o erro para o log do servidor
+END;
+$$;
