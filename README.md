@@ -600,11 +600,9 @@ A interface foi modularizada em um único arquivo, alternando as telas instantan
 - **Versionamento e Metodologia Ágil:** Git, GitHub e GitHub Projects (Kanban)
 
 
----
 
 ## `atualização feita 06/10/2026 (Automação com pg_cron)`
 
----
 
 ## Orquestração Autônoma do Pipeline ELT via pg_cron
 
