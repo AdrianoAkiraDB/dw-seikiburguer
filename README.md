@@ -598,3 +598,29 @@ A interface foi modularizada em um único arquivo, alternando as telas instantan
 - **Visualização / BI:** Power BI Desktop (Modelo Tabular e Medidas Analíticas em DAX)
   
 - **Versionamento e Metodologia Ágil:** Git, GitHub e GitHub Projects (Kanban)
+
+
+---
+
+## `atualização feita 06/10/2026 (Automação com pg_cron)`
+
+---
+
+## Orquestração Autônoma do Pipeline ELT via pg_cron
+
+Nesta etapa, o Data Warehouse deixou de depender de execuções manuais (`CALL prc_...`) e passou a operar de forma 100% autônoma através da extensão nativa **`pg_cron`** no PostgreSQL/Supabase.
+
+### 1. Desafio de Engenharia: Fuso Horário (Timezone Offset)
+- Os servidores do Supabase operam por padrão no fuso horário universal **UTC** (3 horas à frente do Horário de Brasília — UTC-3).
+- **A Solução:** Para garantir que o processamento do fechamento de caixa ocorra no encerramento da operação local (às **23:59 BRT**), o cron job foi configurado matematicamente para disparar às **02:59 UTC** da madrugada seguinte (`59 2 * * *`).
+
+### 2. Configuração do Agendamento (Cron Job)
+- **Extensão:** `pg_cron` ativada diretamente no PostgreSQL.
+- **Tarefa Criada:** `processar_vendas_diario`
+- **Comando Executado:** `CALL prc_processar_vendas_semana();`
+- **Frequência:** Diária (`59 2 * * *`), rodando automaticamente todo final de noite.
+
+### 3. Monitoramento e Auditoria de Tarefas
+A integridade das execuções é acompanhada através das tabelas de metadados do próprio PostgreSQL:
+- `cron.job`: Monitora se a rotina está ativa (`active = true`).
+- `cron.job_run_details`: Armazena o histórico de cada disparo, registrando horário de início, término, tempo de execução e status (`succeeded` ou `failed`).
