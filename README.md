@@ -622,3 +622,28 @@ Nesta etapa, o Data Warehouse deixou de depender de execuções manuais (`CALL p
 A integridade das execuções é acompanhada através das tabelas de metadados do próprio PostgreSQL:
 - `cron.job`: Monitora se a rotina está ativa (`active = true`).
 - `cron.job_run_details`: Armazena o histórico de cada disparo, registrando horário de início, término, tempo de execução e status (`succeeded` ou `failed`).
+
+
+## `atualização feita Observabilidade e Quarentena de Dados`
+
+## Observabilidade de Pipeline (Logs) e Qualidade de Dados (Quarentena / DLQ)
+
+Nesta etapa, o Data Warehouse alcançou nível de robustez enterprise através da implementação de **monitoramento de execução** e **isolamento de dados corrompidos (Dead Letter Queue)**.
+
+### 1. Observabilidade e Auditoria de Cargas (`log_execucao_etl`)
+Para garantir visibilidade operacional sobre as rotinas agendadas via `pg_cron`, foi criada a tabela técnica de telemetria `log_execucao_etl`.
+- **Métricas Registradas:**
+  * `inicio_execucao` e `fim_execucao`: Carimbos temporais com precisão de microssegundos (`clock_timestamp()`).
+  * `tempo_execucao_segundos`: Duração calculada do lote.
+  * `linhas_processadas`: Contagem exata de pedidos distintos processados.
+  * `status`: Indicador binário (`SUCESSO` ou `FALHA`).
+  * `mensagem_erro`: Captura o erro nativo do PostgreSQL (`SQLERRM`) em caso de exceções inesperadas.
+
+### 2. Qualidade de Dados e Quarentena (`stg_vendas_rejeitadas`)
+Implementação do padrão **Dead Letter Queue (DLQ)** para garantir que falhas humanas ou de digitação não quebrem o processamento do lote diário.
+- **Validação de Contrato de Dados (Data Contract):** Antes de alimentar as tabelas Fato, a Stored Procedure realiza uma triagem identificando:
+  * Quantidade menor ou igual a zero (`quantidade <= 0`).
+  * Preços unitários negativos (`preco_unitario < 0`).
+  * Vendas lançadas com datas futuras inconsistentes.
+  * IDs de canais de venda ou formas de pagamento fora dos padrões permitidos.
+- **Resiliência de Carga:** Os registros inválidos são movidos para `stg_vendas_rejeitadas` com a coluna `motivo_rejeicao` devidamente preenchida e marcados como tratados na Staging, permitindo que os pedidos válidos do mesmo dia continuem sendo processados normalmente sem interrupção de caixa.
